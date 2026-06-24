@@ -11,7 +11,18 @@ import (
 )
 
 type waiter struct {
-	ch chan string
+	ch   chan string
+	done <-chan struct{}
+}
+
+// проверяет, успел ли ожидающий запрос получить сообщение в канал
+func (w *waiter) message() (string, bool) {
+	select {
+	case msg := <-w.ch:
+		return msg, true
+	default:
+		return "", false
+	}
 }
 
 type queue struct {
@@ -51,7 +62,9 @@ func (b *broker) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(http.StatusNotFound)
 			return
 		}
-		_, _ = w.Write([]byte(msg))
+		if _, err := w.Write([]byte(msg)); err != nil {
+			b.returnMessage(queueName, msg)
+		}
 	default:
 		w.WriteHeader(http.StatusMethodNotAllowed)
 	}
@@ -71,12 +84,34 @@ func (b *broker) getOrCreateQueue(name string) *queue {
 func (b *broker) putMessage(name, msg string) {
 	b.mu.Lock()
 	queue := b.getOrCreateQueue(name)
-	if len(queue.waiters) > 0 {
-		waiting := queue.waiters[0]       // первый ожидающий
-		queue.waiters = queue.waiters[1:] // первый ожидающий убирается из очереди
-		waiting.ch <- msg
-	} else {
+	if !queue.sendToWaiter(msg) {
 		queue.messages = append(queue.messages, msg)
+	}
+	b.mu.Unlock()
+}
+
+// отдает сообщение первому ожидающему GET запросу, который еще не отменился
+func (q *queue) sendToWaiter(msg string) bool {
+	for len(q.waiters) > 0 {
+		waiting := q.waiters[0]   // первый ожидающий
+		q.waiters = q.waiters[1:] // первый ожидающий убирается из очереди
+		select {
+		case <-waiting.done:
+			continue
+		default:
+			waiting.ch <- msg
+			return true
+		}
+	}
+	return false
+}
+
+// возвращает сообщение обратно в брокер, если клиент не смог его получить
+func (b *broker) returnMessage(name, msg string) {
+	b.mu.Lock()
+	queue := b.getOrCreateQueue(name)
+	if !queue.sendToWaiter(msg) {
+		queue.messages = append([]string{msg}, queue.messages...)
 	}
 	b.mu.Unlock()
 }
@@ -101,7 +136,7 @@ func (b *broker) getMessage(name string, r *http.Request) (string, bool, error) 
 		return "", false, nil
 	}
 
-	w := &waiter{ch: make(chan string, 1)}
+	w := &waiter{ch: make(chan string, 1), done: r.Context().Done()}
 	q.waiters = append(q.waiters, w)
 	b.mu.Unlock()
 
@@ -115,10 +150,13 @@ func (b *broker) getMessage(name string, r *http.Request) (string, bool, error) 
 		if b.removeWaiter(name, w) {
 			return "", false, nil
 		}
-		return <-w.ch, true, nil
+		msg, ok := w.message()
+		return msg, ok, nil
 	case <-r.Context().Done():
 		if !b.removeWaiter(name, w) {
-			<-w.ch
+			if msg, ok := w.message(); ok {
+				b.returnMessage(name, msg)
+			}
 		}
 		return "", false, nil
 	}
